@@ -1,0 +1,18 @@
+[package]
+name = "m3"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+color-eyre = "0.6.2"
+ctrlc = "3.4.2"
+fuser = "0.14.0"
+iced = "0.12.1"
+libc = "0.2.153"
+serde = { version = "1.0.197", features = ["derive"] }
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
+
+[profile.dev.package."*"]
+opt-level = 3
+
