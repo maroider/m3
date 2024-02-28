@@ -56,6 +56,8 @@ impl Filesystem for ModdingFileSystem {
 
     #[tracing::instrument(skip_all)]
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        info!("lookup name: {name:?}");
+
         if parent == 1 && name.to_str() == Some("hello.txt") {
             reply.entry(
                 &Duration::from_secs(1),
@@ -78,7 +80,41 @@ impl Filesystem for ModdingFileSystem {
                 },
                 0,
             );
+        } else if self
+            .mount_point
+            .read_dir()
+            .filter_map(|e| e.ok())
+            .any(|(entry_name, _)| {
+                // chop off the null terminator before comparing
+                let entry_name = entry_name.as_bytes();
+                let entry_name = OsStr::from_bytes(&entry_name[0..entry_name.len() - 1]);
+                entry_name == name
+            })
+        {
+            info!("here");
+            reply.entry(
+                &Duration::from_secs(1),
+                &FileAttr {
+                    ino: 3,
+                    size: 13,
+                    blocks: 1,
+                    atime: UNIX_EPOCH,
+                    mtime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                    crtime: UNIX_EPOCH,
+                    kind: FileType::RegularFile,
+                    perm: 0o644,
+                    nlink: 1,
+                    uid: 501,
+                    gid: 20,
+                    rdev: 0,
+                    flags: 0,
+                    blksize: 512,
+                },
+                0,
+            );
         } else {
+            info!("{name:?} is not present");
             reply.error(ENOENT);
         }
     }
@@ -88,6 +124,8 @@ impl Filesystem for ModdingFileSystem {
 
     #[tracing::instrument(skip_all)]
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+        info!("getattr ino: {ino}");
+
         match ino {
             1 => reply.attr(
                 &Duration::from_secs(1),
@@ -194,7 +232,11 @@ impl Filesystem for ModdingFileSystem {
     // ) {
     // }
 
-    // fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {}
+    #[tracing::instrument(skip_all)]
+    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        info!("open {ino}");
+        reply.opened(0, 0);
+    }
 
     #[tracing::instrument(skip_all)]
     fn read(
@@ -208,6 +250,7 @@ impl Filesystem for ModdingFileSystem {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
+        info!("Reading ino: {ino}");
         if ino == 2 {
             reply.data(&"Hello World!\n".as_bytes()[offset as usize..]);
         } else {
@@ -265,13 +308,7 @@ impl Filesystem for ModdingFileSystem {
             return;
         }
 
-        let read_dir = match self.mount_point.read_dir() {
-            Ok(r) => r,
-            Err(err) => {
-                error!("Error opening directory for enumeration: {err}");
-                return;
-            }
-        };
+        let read_dir = self.mount_point.read_dir();
 
         let entries = [
             (1, FileType::Directory, "."),
@@ -288,26 +325,6 @@ impl Filesystem for ModdingFileSystem {
         for (i, entry) in read_dir.enumerate().skip(offset as usize) {
             match entry {
                 Ok((name, d_type)) => {
-                    let d_type = d_type.unwrap_or_else(|| unsafe {
-                        let mut stat = mem::zeroed::<libc::stat>();
-                        let code = libc::fstatat(
-                            self.mount_point.fd,
-                            name.as_bytes().as_ptr().cast(),
-                            &mut stat,
-                            libc::AT_SYMLINK_NOFOLLOW,
-                        );
-                        match stat.st_mode {
-                            libc::S_IFBLK => FileType::BlockDevice,
-                            libc::S_IFCHR => FileType::CharDevice,
-                            libc::S_IFDIR => FileType::Directory,
-                            libc::S_IFIFO => FileType::NamedPipe,
-                            libc::S_IFREG => FileType::RegularFile,
-                            libc::S_IFSOCK => FileType::Socket,
-                            _ => {
-                                todo!()
-                            }
-                        }
-                    });
                     if reply.add(i as u64 + 3, (i + 1) as i64, d_type, name) {
                         break;
                     }
@@ -475,9 +492,8 @@ impl Filesystem for ModdingFileSystem {
 
 #[derive(Debug)]
 struct MountPoint {
-    // FIXME: Don't use the fd here after all. We can use a `*mut DIR` here as originally
-    // attempted, and we can reset it with `rewinddir`.
     fd: c_int,
+    dir: *mut libc::DIR,
 }
 
 impl MountPoint {
@@ -486,15 +502,16 @@ impl MountPoint {
         if fd == -1 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { fd })
-    }
-
-    fn read_dir(&self) -> io::Result<ReadDir> {
-        let dir = unsafe { libc::fdopendir(self.fd) };
+        let dir = unsafe { libc::opendir(name.as_ptr().cast()) };
         if dir.is_null() {
             return Err(io::Error::last_os_error());
         }
-        Ok(ReadDir::new(dir))
+        Ok(Self { fd, dir })
+    }
+
+    fn read_dir(&self) -> ReadDir {
+        unsafe { libc::rewinddir(self.dir) };
+        ReadDir::new(self.dir, self.fd)
     }
 }
 
@@ -504,13 +521,15 @@ unsafe impl Send for MountPoint {}
 ///
 /// <https://github.com/rust-lang/rust/blob/master/library/std/src/sys/pal/unix/fs.rs#L690>
 struct ReadDir {
+    fd: c_int,
     dir: *mut libc::DIR,
     end_of_stream: bool,
 }
 
 impl ReadDir {
-    fn new(dir: *mut libc::DIR) -> ReadDir {
+    fn new(dir: *mut libc::DIR, fd: c_int) -> ReadDir {
         Self {
+            fd,
             dir,
             end_of_stream: false,
         }
@@ -518,45 +537,73 @@ impl ReadDir {
 }
 
 impl Iterator for ReadDir {
-    type Item = io::Result<(OsString, Option<FileType>)>;
+    type Item = io::Result<(OsString, FileType)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.end_of_stream {
-            return None;
-        }
-        unsafe { *libc::__errno_location() = 0 };
-        let entry = unsafe { libc::readdir64(self.dir) };
-        if entry.is_null() {
-            self.end_of_stream = true;
-
-            return match unsafe { *libc::__errno_location() } {
-                0 => None,
-                e => Some(Err(io::Error::from_raw_os_error(e))),
-            };
-        }
-        let name =
-            unsafe { CStr::from_ptr(entry.cast::<i8>().add(offset_of!(libc::dirent64, d_name))) };
-        let name = OsStr::from_bytes(name.to_bytes_with_nul()).to_owned();
-        let d_type = unsafe {
-            *entry
-                .cast::<u8>()
-                .add(offset_of!(libc::dirent64, d_type))
-                .cast::<c_uchar>()
-        };
-        let file_type = match d_type {
-            libc::DT_BLK => Some(FileType::BlockDevice),
-            libc::DT_CHR => Some(FileType::CharDevice),
-            libc::DT_DIR => Some(FileType::Directory),
-            libc::DT_FIFO => Some(FileType::NamedPipe),
-            libc::DT_LNK => Some(FileType::Symlink),
-            libc::DT_REG => Some(FileType::RegularFile),
-            libc::DT_SOCK => Some(FileType::Socket),
-            libc::DT_UNKNOWN => None,
-            _ => {
-                warn!("Unknown d_type: {d_type}");
-                None
+        loop {
+            if self.end_of_stream {
+                return None;
             }
-        };
-        Some(Ok((name, file_type)))
+            unsafe { *libc::__errno_location() = 0 };
+            let entry = unsafe { libc::readdir64(self.dir) };
+            if entry.is_null() {
+                self.end_of_stream = true;
+
+                return match unsafe { *libc::__errno_location() } {
+                    0 => None,
+                    e => Some(Err(io::Error::from_raw_os_error(e))),
+                };
+            }
+            let name = unsafe {
+                CStr::from_ptr(entry.cast::<i8>().add(offset_of!(libc::dirent64, d_name)))
+            };
+            let name = OsStr::from_bytes(name.to_bytes_with_nul()).to_owned();
+            let d_type = unsafe {
+                *entry
+                    .cast::<u8>()
+                    .add(offset_of!(libc::dirent64, d_type))
+                    .cast::<c_uchar>()
+            };
+            let file_type = match d_type {
+                libc::DT_BLK => Some(FileType::BlockDevice),
+                libc::DT_CHR => Some(FileType::CharDevice),
+                libc::DT_DIR => Some(FileType::Directory),
+                libc::DT_FIFO => Some(FileType::NamedPipe),
+                libc::DT_LNK => Some(FileType::Symlink),
+                libc::DT_REG => Some(FileType::RegularFile),
+                libc::DT_SOCK => Some(FileType::Socket),
+                libc::DT_UNKNOWN => unsafe {
+                    let mut stat = mem::zeroed::<libc::stat>();
+                    let code = libc::fstatat(
+                        self.fd,
+                        name.as_bytes().as_ptr().cast(),
+                        &mut stat,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    );
+                    if code == -1 {
+                        error!(
+                            "Error getting file type/mode: {}",
+                            io::Error::last_os_error()
+                        );
+                    }
+                    match stat.st_mode {
+                        libc::S_IFBLK => Some(FileType::BlockDevice),
+                        libc::S_IFCHR => Some(FileType::CharDevice),
+                        libc::S_IFDIR => Some(FileType::Directory),
+                        libc::S_IFIFO => Some(FileType::NamedPipe),
+                        libc::S_IFREG => Some(FileType::RegularFile),
+                        libc::S_IFSOCK => Some(FileType::Socket),
+                        _ => None,
+                    }
+                },
+                _ => {
+                    error!("Unknown d_type: {d_type}");
+                    None
+                }
+            };
+            if let Some(file_type) = file_type {
+                return Some(Ok((name, file_type)));
+            }
+        }
     }
 }
