@@ -21,7 +21,7 @@ use fuser::{
 use indexmap::IndexMap;
 use libc::{ino64_t, stat64, ENOENT};
 use slab::Slab;
-use tracing::{error, info, info_span, warn};
+use tracing::{debug, debug_span, error, info, trace, warn};
 
 static EXIT: AtomicBool = AtomicBool::new(false);
 
@@ -66,16 +66,15 @@ impl Filesystem for ModdingFileSystem {
         info!("Unmounting modding file system");
     }
 
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip(self, _req, parent, reply))]
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        info!("lookup name: {name:?}");
-
         if let Some((_, entry)) = self
             .mount_point
             .read_dir(parent)
             .find(|(entry_name, _)| *entry_name == name)
         {
             let stat = &entry.stat;
+            info!("{name:?} is ino {}", stat.st_ino);
             reply.entry(
                 &Duration::from_secs(1),
                 &FileAttr {
@@ -100,7 +99,7 @@ impl Filesystem for ModdingFileSystem {
                 0,
             )
         } else {
-            info!("{name:?} is not present");
+            warn!("{name:?} is not present");
             reply.error(ENOENT);
         }
     }
@@ -108,10 +107,8 @@ impl Filesystem for ModdingFileSystem {
     // Seems to be entirely advisory. Default impl does nothing.
     // fn forget(&mut self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {}
 
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip(self, _req, reply))]
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        info!("getattr ino: {ino}");
-
         match self.mount_point.files.get(&ino) {
             Some(entry) => {
                 let stat = &entry.stat;
@@ -223,10 +220,8 @@ impl Filesystem for ModdingFileSystem {
     // ) {
     // }
 
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip(self, _req, reply))]
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        let span = info_span!("open", ino);
-        let _span = span.enter();
         if let Some(path) = self.mount_point.path_from_inode(ino) {
             info!("Opening {} with flags {flags:#X}", path.display());
             let mut path = path.into_os_string().into_vec();
@@ -251,7 +246,7 @@ impl Filesystem for ModdingFileSystem {
         }
     }
 
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip(self, _req, offset, size, _flags, _lock, reply))]
     fn read(
         &mut self,
         _req: &Request,
@@ -263,7 +258,7 @@ impl Filesystem for ModdingFileSystem {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        info!("Reading ino: {ino}");
+        trace!("Reading {size} bytes at offset {offset}");
 
         if let Some(file) = self.open_files.get_mut(fh as usize) {
             if let Err(err) = file.seek(SeekFrom::Start(offset as u64)) {
@@ -316,7 +311,7 @@ impl Filesystem for ModdingFileSystem {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        info!("release {ino}");
+        debug!("release {ino}");
         self.open_files.remove(fh as usize);
         reply.ok();
     }
@@ -328,7 +323,7 @@ impl Filesystem for ModdingFileSystem {
         reply.opened(0, 0);
     }
 
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip(self, _req, _fh, reply))]
     fn readdir(
         &mut self,
         _req: &Request<'_>,
@@ -337,7 +332,6 @@ impl Filesystem for ModdingFileSystem {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        info!("readdir {ino}");
         for (i, (name, entry)) in self
             .mount_point
             .read_dir(ino)
@@ -397,7 +391,7 @@ impl Filesystem for ModdingFileSystem {
     //     _value: &[u8],
     //     flags: i32,
     //     position: u32,
-    //     reply: ReplyEmpty,
+    //     reply: ReplyEmpty,to
     // ) {
     // }
 
@@ -530,9 +524,8 @@ struct FileEntry {
 }
 
 impl MountPoint {
+    #[tracing::instrument]
     fn open(name: &str) -> io::Result<Self> {
-        let span = info_span!("MountPoint::open");
-        let _span = span.entered();
         let mut name = name.to_owned();
         name.push('\0');
         let fd = unsafe { libc::open(name.as_ptr().cast(), libc::O_DIRECTORY | libc::O_PATH) };
@@ -559,7 +552,7 @@ impl MountPoint {
         let mut in_dir_name_to_file = IndexMap::new();
         let mut directories = vec![(PathBuf::new(), 1)];
         while let Some((dir_name, dir_inode)) = directories.pop() {
-            let span = info_span!("", dir_name = format!("{}", dir_name.display()),);
+            let span = debug_span!("", dir_name = format!("{}", dir_name.display()),);
             let _span = span.enter();
             let read_dir = if dir_inode == 1 {
                 ReadDir::new(dir, fd)
@@ -571,7 +564,7 @@ impl MountPoint {
                         .chain(iter::once(0))
                         .collect::<Vec<u8>>(),
                 );
-                info!("Opening {}", Path::new(&name).display());
+                debug!("Opening {}", Path::new(&name).display());
                 let fd = unsafe {
                     libc::open(
                         name.as_bytes().as_ptr().cast(),
@@ -633,17 +626,23 @@ impl MountPoint {
             })
     }
 
+    #[tracing::instrument(skip(self))]
     fn path_from_inode(&self, inode: u64) -> Option<PathBuf> {
         for ((entry_parent_dir, entry_name), entry_inode) in self.in_dir_name_to_file.iter() {
             if *entry_inode != inode {
                 continue;
             }
+            debug!("Found name for inode: {entry_name:?} with parent ino {entry_parent_dir}");
             let mut parents = vec![];
             let mut parent_inode = *entry_parent_dir;
             while let Some(parent_entry) = self.files.get(&parent_inode) {
+                let span = debug_span!("", ino = parent_entry.stat.st_ino);
+                let _span = span.enter();
                 if parent_entry.stat.st_ino == 0 || parent_entry.stat.st_ino == 1 {
+                    debug!("Skipping");
                     break;
                 }
+                debug!("Parent of {parent_inode} is {}", parent_entry.parent);
                 parents.push(parent_entry.stat.st_ino);
                 parent_inode = parent_entry.parent;
                 continue;
@@ -651,7 +650,8 @@ impl MountPoint {
             return Some(
                 parents
                     .into_iter()
-                    .map(|parent| self.dir_names.get(&parent).unwrap())
+                    .rev()
+                    .flat_map(|parent| self.dir_names.get(&parent))
                     .chain(iter::once(entry_name))
                     .collect(),
             );
@@ -684,9 +684,8 @@ impl ReadDir {
 impl Iterator for ReadDir {
     type Item = (OsString, stat64);
 
+    #[tracing::instrument(skip(self))]
     fn next(&mut self) -> Option<Self::Item> {
-        let span = info_span!("ReadDir::next");
-        let _span = span.entered();
         loop {
             if self.end_of_stream {
                 return None;
@@ -723,7 +722,7 @@ impl Iterator for ReadDir {
             let mut name = name.into_vec();
             name.pop();
             let name = OsString::from_vec(name);
-            info!("Enumerating {name:?}");
+            debug!("Enumerating {name:?}");
             return Some((name, stat));
         }
     }
