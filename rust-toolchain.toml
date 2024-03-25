@@ -2,6 +2,6 @@
 # - `mem::offset_of`: Will be stabilized when 1.77 is released.
 
 [toolchain]
-channel = "nightly-2024-02-26"
+channel = "nightly-2024-03-18"
 components = ["rust-analyzer"]
 profile = "default"

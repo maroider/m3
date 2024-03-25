@@ -1,37 +1,42 @@
 use std::{
+    any::{type_name_of_val, Any},
+    collections::HashMap,
     ffi::{c_int, CStr, OsStr, OsString},
+    fmt::Debug,
     fs::File,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     iter,
     mem::{self, offset_of},
     os::{
         fd::FromRawFd,
         unix::ffi::{OsStrExt, OsStringExt},
     },
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
+    thread,
     time::{Duration, SystemTime},
 };
 
 use color_eyre::eyre;
 use fuser::{
-    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
+    FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, Request,
 };
-use indexmap::IndexMap;
 use libc::{ino64_t, stat64, ENOENT};
 use slab::Slab;
 use tracing::{debug, debug_span, error, info, trace, warn};
+
+use crate::vfs::{self, Vfs};
 
 static EXIT: AtomicBool = AtomicBool::new(false);
 
 pub fn launch() -> eyre::Result<()> {
     ctrlc::set_handler(|| EXIT.store(true, Ordering::SeqCst))?;
     let path = "./testdir/gamedir";
-    let mount_point = MountPoint::open(path)?;
-    let _handle = fuser::spawn_mount2(ModdingFileSystem::new(mount_point), path, &[])?;
+    let _handle = fuser::spawn_mount2(ModdingFileSystem::new(path)?, path, &[])?;
 
     loop {
+        thread::sleep(Duration::from_millis(100));
         if EXIT.load(Ordering::SeqCst) {
             break;
         }
@@ -40,18 +45,49 @@ pub fn launch() -> eyre::Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+pub trait WriteSeek: Read + Write + Seek + Send {}
+impl<W> WriteSeek for W where W: Read + Write + Seek + Send {}
+
 struct ModdingFileSystem {
-    mount_point: MountPoint,
-    open_files: Slab<File>,
+    vfs: Vfs,
+    inode_to_path: HashMap<ino64_t, PathBuf>,
+    path_inodes: HashMap<PathBuf, ino64_t>,
+    next_inode: ino64_t,
+    open_files: Slab<Box<dyn WriteSeek>>,
+}
+
+impl Debug for ModdingFileSystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModdingFileSystem")
+            .field("vfs", &self.vfs)
+            .field("inode_to_path", &self.inode_to_path)
+            .field("path_inodes", &self.path_inodes)
+            .field("next_inode", &self.next_inode)
+            .field("open_files", &[(); 0])
+            .finish()
+    }
 }
 
 impl ModdingFileSystem {
-    fn new(mount_point: MountPoint) -> Self {
-        Self {
-            mount_point,
+    fn new<P>(path: &P) -> eyre::Result<Self>
+    where
+        P: AsRef<Path> + Debug + ?Sized,
+    {
+        let mut inode_to_path = HashMap::new();
+        inode_to_path.insert(1, "/".into());
+        let mut path_inodes = HashMap::new();
+        path_inodes.insert("/".into(), 1);
+        let mut next_inode = 2;
+        let mount_point = MountPoint::open(path, &mut next_inode)?;
+        let mut vfs = Vfs::new();
+        vfs.push_layer(mount_point);
+        Ok(Self {
+            vfs,
+            inode_to_path,
+            path_inodes,
+            next_inode,
             open_files: Slab::new(),
-        }
+        })
     }
 }
 
@@ -68,40 +104,33 @@ impl Filesystem for ModdingFileSystem {
 
     #[tracing::instrument(skip(self, _req, parent, reply))]
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        if let Some((_, entry)) = self
-            .mount_point
-            .read_dir(parent)
-            .find(|(entry_name, _)| *entry_name == name)
-        {
-            let stat = &entry.stat;
-            info!("{name:?} is ino {}", stat.st_ino);
-            reply.entry(
-                &Duration::from_secs(1),
-                &FileAttr {
-                    ino: stat.st_ino,
-                    size: stat.st_size as u64,
-                    blocks: stat.st_blocks as u64,
-                    atime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_atime as u64),
-                    mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_mtime as u64),
-                    ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_ctime as u64),
-                    // macos only, don't care
-                    crtime: SystemTime::UNIX_EPOCH,
-                    kind: stat_file_type(stat).unwrap(),
-                    perm: stat.st_mode as u16,
-                    nlink: stat.st_nlink as u32,
-                    uid: stat.st_uid,
-                    gid: stat.st_gid,
-                    rdev: stat.st_rdev as u32,
-                    blksize: stat.st_blksize as u32,
-                    // macos only, don't care
-                    flags: 0,
-                },
-                0,
-            )
-        } else {
+        let Some(parent_path) = self.inode_to_path.get(&parent) else {
+            error!("No path registered for inode {parent}");
+            reply.error(ENOENT);
+            return;
+        };
+
+        let Some(entry) = self
+            .vfs
+            .read_dir(parent_path)
+            .and_then(|mut readdir| readdir.find(|entry| entry.name == name))
+        else {
             warn!("{name:?} is not present");
             reply.error(ENOENT);
-        }
+            return;
+        };
+
+        // FIXME: Factor out the second hashmap lookup here
+        let item_path = parent_path.join(entry.name);
+        let Some(attrs) = self.vfs.file_attr(&item_path) else {
+            error!("Couldn't get file attributes for {}", item_path.display());
+            reply.error(ENOENT);
+            return;
+        };
+
+        info!("{name:?} is ino {}", attrs.ino);
+        self.inode_to_path.insert(attrs.ino, item_path);
+        reply.entry(&Duration::from_secs(1), &attrs, 0);
     }
 
     // Seems to be entirely advisory. Default impl does nothing.
@@ -109,34 +138,16 @@ impl Filesystem for ModdingFileSystem {
 
     #[tracing::instrument(skip(self, _req, reply))]
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        match self.mount_point.files.get(&ino) {
-            Some(entry) => {
-                let stat = &entry.stat;
-                reply.attr(
-                    &Duration::from_secs(1),
-                    &FileAttr {
-                        ino: stat.st_ino,
-                        size: stat.st_size as u64,
-                        blocks: stat.st_blocks as u64,
-                        atime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_atime as u64),
-                        mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_mtime as u64),
-                        ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_ctime as u64),
-                        // macos only, don't care
-                        crtime: SystemTime::UNIX_EPOCH,
-                        kind: stat_file_type(stat).unwrap(),
-                        perm: stat.st_mode as u16,
-                        nlink: stat.st_nlink as u32,
-                        uid: stat.st_uid,
-                        gid: stat.st_gid,
-                        rdev: stat.st_rdev as u32,
-                        blksize: stat.st_blksize as u32,
-                        // macos only, don't care
-                        flags: 0,
-                    },
-                );
+        if let Some(path) = self.inode_to_path.get(&ino) {
+            debug!("ino present as {}", path.display());
+            if let Some(attrs) = self.vfs.file_attr(path) {
+                debug!("attrs exist");
+                reply.attr(&Duration::from_secs(120), &attrs);
+                return;
             }
-            _ => reply.error(ENOENT),
         }
+        error!("Not present");
+        reply.error(ENOENT);
     }
 
     // fn setattr(
@@ -222,27 +233,43 @@ impl Filesystem for ModdingFileSystem {
 
     #[tracing::instrument(skip(self, _req, reply))]
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        if let Some(path) = self.mount_point.path_from_inode(ino) {
-            info!("Opening {} with flags {flags:#X}", path.display());
-            let mut path = path.into_os_string().into_vec();
-            path.push(0);
-            let fd = unsafe { libc::openat(self.mount_point.fd, path.as_ptr().cast(), flags, 0) };
+        info!("");
+        let path = self.inode_to_path.get(&ino).unwrap();
+        info!("{}", path.display());
+        let Some(layer) = self.vfs.layer_that_opens_file(path) else {
+            reply.error(ENOENT);
+            error!("no layer can open the given file");
+            return;
+        };
+        if let Some(mount_point) = layer.as_any().downcast_ref::<MountPoint>() {
+            info!("Layer found: {}", type_name_of_val(mount_point));
+            info!("Opening {}", path.display());
+            let path = path
+                .as_os_str()
+                .as_bytes()
+                .iter()
+                .skip(1) // Remove the leading /
+                .cloned()
+                .chain(iter::once(0))
+                .collect::<Vec<_>>();
+            let fd = unsafe { libc::openat(mount_point.fd, path.as_ptr().cast(), flags, 0) };
             if fd == -1 {
                 let err = io::Error::last_os_error();
+                error!("Could not open file: {err}");
                 if let Some(err) = err.raw_os_error() {
                     reply.error(err);
                 } else {
-                    // FIXME: Find a better fallback
+                    // FIXME: Not sure what to return here
+                    error!("No OS error");
                     reply.error(ENOENT);
                 }
-                error!("Couldn't open file: {err}",);
                 return;
             }
-            let idx = self.open_files.insert(unsafe { File::from_raw_fd(fd) });
+            let file = unsafe { File::from_raw_fd(fd) };
+            let idx = self.open_files.insert(Box::new(file));
             reply.opened(idx as u64, flags as u32);
         } else {
-            info!("No entry for file");
-            reply.error(ENOENT);
+            error!("Unhandled layer type");
         }
     }
 
@@ -332,21 +359,49 @@ impl Filesystem for ModdingFileSystem {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        for (i, (name, entry)) in self
-            .mount_point
-            .read_dir(ino)
-            .enumerate()
-            .skip(offset as usize)
-        {
+        info!("");
+        // TODO: Use the VFS instead
+        let Some(path) = self.inode_to_path.get(&ino) else {
+            // TODO: Make sure this is a reasonable error value for this case?
+            // Granted, I don't think it's particularly likely that we'll hit this branch without
+            // skill issue on my end.
+            warn!("Could not find path for ino {ino}");
+            reply.error(libc::ENOENT);
+            return;
+        };
+
+        let Some(readdir) = self.vfs.read_dir(path) else {
+            warn!("Couldn't enumerate {ino}: {}", path.display());
+            return;
+        };
+
+        let mut new_inode_to_path = Vec::new();
+        for (i, entry) in readdir.skip(offset as usize).enumerate() {
+            let path = path.join(&entry.name);
+            // We assume there's no mapping, and that this is the only place we need to "materialize"
+            // the mapping.
+            // FIXME: Make the file attributes respect the mapping...
+            info!("Enumerating {}", path.display());
+            let inode = self.path_inodes.entry(path.clone()).or_insert_with(|| {
+                let inode = self.next_inode;
+                new_inode_to_path.push((inode, path));
+                self.next_inode += 1;
+                inode
+            });
             if reply.add(
-                entry.stat.st_ino,
+                *inode,
                 (i + 1) as i64,
-                stat_file_type(&entry.stat).unwrap(),
-                name,
+                match entry.typ {
+                    vfs::FileType::Dir => FileType::Directory,
+                    vfs::FileType::File => FileType::RegularFile,
+                    vfs::FileType::Symlink => FileType::Symlink,
+                },
+                entry.name,
             ) {
                 break;
             }
         }
+        self.inode_to_path.extend(new_inode_to_path);
 
         reply.ok();
     }
@@ -509,25 +564,26 @@ impl Filesystem for ModdingFileSystem {
 #[derive(Debug)]
 struct MountPoint {
     fd: c_int,
-    files: IndexMap<ino64_t, FileEntry>,
-    dir_names: IndexMap<ino64_t, OsString>,
-    in_dir_name_to_file: IndexMap<(ino64_t, OsString), ino64_t>,
+    files: Vec<FileEntry>,
 }
 
 #[derive(Debug)]
 struct FileEntry {
     stat: stat64,
-    // Only used to recover a useful path for `open` and the like.
-    parent: ino64_t,
     // Only set for directories
-    dir_contents: Option<Vec<OsString>>,
+    dir_contents: Option<Vec<(usize, OsString)>>,
 }
 
 impl MountPoint {
     #[tracing::instrument]
-    fn open(name: &str) -> io::Result<Self> {
-        let mut name = name.to_owned();
-        name.push('\0');
+    fn open<P>(name: P, next_inode: &mut ino64_t) -> io::Result<Self>
+    where
+        P: AsRef<Path> + Debug,
+    {
+        // A lot of this can likely be removed once https://github.com/rust-lang/rust/issues/120426
+        // gets implemented.
+        let mut name = name.as_ref().to_owned().into_os_string().into_vec();
+        name.push(0);
         let fd = unsafe { libc::open(name.as_ptr().cast(), libc::O_DIRECTORY | libc::O_PATH) };
         if fd == -1 {
             return Err(io::Error::last_os_error());
@@ -538,27 +594,21 @@ impl MountPoint {
         }
         let stat = unsafe { _fstat64(fd)? };
         name.pop();
-        let mut files = IndexMap::new();
-        files.insert(
-            1,
-            FileEntry {
-                stat,
-                dir_contents: None,
-                parent: 0,
-            },
-        );
-        let mut dir_names = IndexMap::new();
-        dir_names.insert(1, name.clone().into());
-        let mut in_dir_name_to_file = IndexMap::new();
-        let mut directories = vec![(PathBuf::new(), 1)];
-        while let Some((dir_name, dir_inode)) = directories.pop() {
+        let mut files = Vec::new();
+        files.push(FileEntry {
+            stat,
+            dir_contents: None,
+        });
+        let mut directories = vec![(PathBuf::new(), 0)];
+        while let Some((dir_name, dir_idx)) = directories.pop() {
             let span = debug_span!("", dir_name = format!("{}", dir_name.display()),);
             let _span = span.enter();
-            let read_dir = if dir_inode == 1 {
+            let read_dir = if dir_idx == 0 {
                 ReadDir::new(dir, fd)
             } else {
                 let name = OsString::from_vec(
-                    name.bytes()
+                    name.iter()
+                        .cloned()
                         .chain(iter::once(b'/'))
                         .chain(dir_name.as_os_str().as_bytes().iter().cloned())
                         .chain(iter::once(0))
@@ -585,82 +635,108 @@ impl MountPoint {
                 ReadDir::new(dir, fd)
             };
             let mut dir_contents = Vec::new();
-            for (name, stat) in read_dir {
-                if FileType::Directory == stat_file_type(&stat).unwrap()
-                    && name != "."
-                    && name != ".."
-                {
-                    dir_names.insert(stat.st_ino, name.clone());
-                    directories.push((dir_name.join(&name), stat.st_ino));
+            for (name, mut stat) in read_dir {
+                if FileType::Directory == stat_file_type(&stat).unwrap() {
+                    directories.push((dir_name.join(&name), files.len()));
                 }
-                dir_contents.push(name.clone());
-                in_dir_name_to_file.insert((dir_inode, name), stat.st_ino);
-                files.entry(stat.st_ino).or_insert_with(|| FileEntry {
+                dir_contents.push((files.len(), name.clone()));
+                stat.st_ino = *next_inode;
+                *next_inode += 1;
+                files.push(FileEntry {
                     stat,
-                    parent: dir_inode,
                     dir_contents: None,
                 });
             }
-            files.get_mut(&dir_inode).unwrap().dir_contents = Some(dir_contents);
+            files.get_mut(dir_idx).unwrap().dir_contents = Some(dir_contents);
         }
-        Ok(Self {
-            fd,
-            files,
-            dir_names,
-            in_dir_name_to_file,
-        })
+        Ok(Self { fd, files })
     }
 
-    fn read_dir(&self, inode: u64) -> impl Iterator<Item = (&OsString, &FileEntry)> {
-        self.files
-            .get(&inode)
-            .and_then(|root| root.dir_contents.as_ref())
-            .into_iter()
-            .flat_map(move |dir_contents| {
-                dir_contents.iter().flat_map(move |in_dir_name| {
-                    self.in_dir_name_to_file
-                        .get(&(inode, in_dir_name.clone()))
-                        .and_then(|child_inode| self.files.get(child_inode))
-                        .map(|file_entry| (in_dir_name, file_entry))
-                })
-            })
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn path_from_inode(&self, inode: u64) -> Option<PathBuf> {
-        for ((entry_parent_dir, entry_name), entry_inode) in self.in_dir_name_to_file.iter() {
-            if *entry_inode != inode {
-                continue;
-            }
-            debug!("Found name for inode: {entry_name:?} with parent ino {entry_parent_dir}");
-            let mut parents = vec![];
-            let mut parent_inode = *entry_parent_dir;
-            while let Some(parent_entry) = self.files.get(&parent_inode) {
-                let span = debug_span!("", ino = parent_entry.stat.st_ino);
-                let _span = span.enter();
-                if parent_entry.stat.st_ino == 0 || parent_entry.stat.st_ino == 1 {
-                    debug!("Skipping");
-                    break;
+    fn find_entry_idx_for_path(&self, path: &Path) -> Option<usize> {
+        let mut current_entry_idx = 0;
+        for component in path.components() {
+            if let Component::Normal(name) = component {
+                let current_entry = &self.files[current_entry_idx];
+                if let Some(dir_contents) = &current_entry.dir_contents {
+                    if let Some((idx, _)) = dir_contents.iter().find(|(_, n)| n == name) {
+                        current_entry_idx = *idx;
+                        continue;
+                    }
                 }
-                debug!("Parent of {parent_inode} is {}", parent_entry.parent);
-                parents.push(parent_entry.stat.st_ino);
-                parent_inode = parent_entry.parent;
-                continue;
+                // The directory doesn't exist
+                return None;
             }
-            return Some(
-                parents
-                    .into_iter()
-                    .rev()
-                    .flat_map(|parent| self.dir_names.get(&parent))
-                    .chain(iter::once(entry_name))
-                    .collect(),
-            );
         }
-        None
+        Some(current_entry_idx)
     }
 }
 
 unsafe impl Send for MountPoint {}
+
+impl vfs::Layer for MountPoint {
+    fn as_any(&self) -> &(dyn Any + 'static) {
+        self
+    }
+
+    fn dir_exists(&self, dir: &Path) -> bool {
+        self.find_entry_idx_for_path(dir)
+            .map(|entry_idx| self.files[entry_idx].dir_contents.is_some())
+            .unwrap_or(false)
+    }
+
+    fn file_exists(&self, file: &Path) -> bool {
+        self.find_entry_idx_for_path(file)
+            .map(|idx| self.files[idx].dir_contents.is_none())
+            .unwrap_or(false)
+    }
+
+    fn read_dir(&self, dir: &Path, callback: &mut dyn FnMut(vfs::DirEntry)) {
+        let Some(entry_idx) = self.find_entry_idx_for_path(dir) else {
+            return;
+        };
+        let current_entry = &self.files[entry_idx];
+        if let Some(dir_contents) = &current_entry.dir_contents {
+            for (entry_idx, entry_name) in dir_contents {
+                let file = &self.files[*entry_idx];
+                let Some(typ) = stat_vfs_file_type(&file.stat) else {
+                    warn!("Unsupported filetype {}", file.stat.st_mode & libc::S_IFMT);
+                    continue;
+                };
+                let entry = vfs::DirEntry {
+                    name: entry_name.to_owned(),
+                    typ,
+                };
+                callback(entry);
+            }
+        }
+    }
+
+    fn file_attr(&self, file: &Path) -> Option<fuser::FileAttr> {
+        self.find_entry_idx_for_path(file).map(|idx| {
+            let file = &self.files[idx];
+            let stat = &file.stat;
+            fuser::FileAttr {
+                ino: stat.st_ino,
+                size: stat.st_size as u64,
+                blocks: stat.st_blocks as u64,
+                atime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_atime as u64),
+                mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_mtime as u64),
+                ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_ctime as u64),
+                // macos only, don't care
+                crtime: SystemTime::UNIX_EPOCH,
+                kind: stat_file_type(stat).unwrap(),
+                perm: stat.st_mode as u16,
+                nlink: stat.st_nlink as u32,
+                uid: stat.st_uid,
+                gid: stat.st_gid,
+                rdev: stat.st_rdev as u32,
+                blksize: stat.st_blksize as u32,
+                // macos only, don't care
+                flags: 0,
+            }
+        })
+    }
+}
 
 /// Adapted from `std` since I can't re-use the type :(
 ///
@@ -707,6 +783,12 @@ impl Iterator for ReadDir {
             let name = unsafe {
                 CStr::from_ptr(entry.cast::<i8>().add(offset_of!(libc::dirent64, d_name)))
             };
+            // Are "." and ".." guaranteed to always be directory names? I would assume no
+            // reasonable filesystem would let you assign these names to something else (maybe NTFS
+            // would, idk), but it's probably not an issue in practice.
+            if name == c"." || name == c".." {
+                continue;
+            }
             let name = OsStr::from_bytes(name.to_bytes_with_nul()).to_owned();
             let stat = match unsafe { _fstatat64(self.fd, name.as_bytes().as_ptr().cast()) } {
                 Some(stat) => {
@@ -743,8 +825,18 @@ fn stat_file_type(stat: &stat64) -> Option<FileType> {
         libc::S_IFCHR => Some(FileType::CharDevice),
         libc::S_IFDIR => Some(FileType::Directory),
         libc::S_IFIFO => Some(FileType::NamedPipe),
+        libc::S_IFLNK => Some(FileType::Symlink),
         libc::S_IFREG => Some(FileType::RegularFile),
         libc::S_IFSOCK => Some(FileType::Socket),
+        _ => None,
+    }
+}
+
+fn stat_vfs_file_type(stat: &stat64) -> Option<vfs::FileType> {
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => Some(vfs::FileType::Dir),
+        libc::S_IFLNK => Some(vfs::FileType::Symlink),
+        libc::S_IFREG => Some(vfs::FileType::File),
         _ => None,
     }
 }
