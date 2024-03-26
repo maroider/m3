@@ -9,22 +9,44 @@ use std::{
 };
 
 use slab::Slab;
-use tracing::{debug, error};
+use tracing::{debug, debug_span, error};
 
 // TODO: Add some way of mounting a layer at a particular path other than the root
 
+#[derive(Debug)]
 pub struct Vfs {
-    layers: Slab<Box<dyn Layer>>,
+    layers: Slab<LayerAt>,
     // NOTE: Not used yet
     order: Vec<usize>,
 }
 
-impl std::fmt::Debug for Vfs {
+pub struct LayerAt {
+    pub at: Option<PathBuf>,
+    pub layer: Box<dyn Layer>,
+}
+
+impl std::fmt::Debug for LayerAt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Vfs")
-            .field("layers", &[(); 0])
-            .field("order", &self.order)
+        f.debug_struct("LayerAt")
+            .field("at", &self.at)
+            .field("layer", &())
             .finish()
+    }
+}
+
+impl LayerAt {
+    /// Returns `None` when the path can't be mapped, which usually means you should ignore the
+    /// layer.
+    fn map_path_at<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+        if let Some(at) = &self.at {
+            let to = path.strip_prefix(at).ok();
+            if let Some(to) = &to {
+                debug!("mapped {} to {}", path.display(), to.display());
+            }
+            to
+        } else {
+            Some(path)
+        }
     }
 }
 
@@ -48,11 +70,25 @@ impl Vfs {
         }
     }
 
+    pub fn push_layer_at<L, P>(&mut self, layer: L, path: P)
+    where
+        L: Layer,
+        P: AsRef<Path>,
+    {
+        let _idx = self.layers.insert(LayerAt {
+            at: Some(path.as_ref().to_path_buf()),
+            layer: Box::new(layer),
+        });
+    }
+
     pub fn push_layer<L>(&mut self, layer: L)
     where
         L: Layer,
     {
-        let _idx = self.layers.insert(Box::new(layer));
+        let _idx = self.layers.insert(LayerAt {
+            at: None,
+            layer: Box::new(layer),
+        });
     }
 
     // FIXME: None of the VFS querying functions handle the case where a name may be a dir in one
@@ -64,11 +100,12 @@ impl Vfs {
         if !dir.as_ref().is_absolute() {
             panic!(r#"{} does not start with a "/""#, dir.as_ref().display());
         }
-        if !self
-            .layers
-            .iter()
-            .any(|(_, layer)| layer.as_ref().dir_exists(dir.as_ref()))
-        {
+        if !self.layers.iter().any(|(_, layer_at)| {
+            let Some(dir) = layer_at.map_path_at(dir.as_ref()) else {
+                return false;
+            };
+            layer_at.layer.as_ref().dir_exists(dir.as_ref())
+        }) {
             return None;
         }
         let mut enumerated = HashSet::new();
@@ -76,9 +113,15 @@ impl Vfs {
         let mut layer_opt = layers.next().map(|(_, l)| l);
         let mut to_yield = Vec::new();
         Some(iter::from_fn(move || {
+            let _span = debug_span!("read_dir iterator").entered();
             if to_yield.is_empty() {
-                if let Some(layer) = layer_opt {
-                    layer.read_dir(dir.as_ref(), &mut |entry| {
+                while let Some(layer_at) = layer_opt {
+                    let Some(mapped_dir) = layer_at.map_path_at(dir.as_ref()) else {
+                        layer_opt = layers.next().map(|(_, l)| l);
+                        debug!("skipping layer");
+                        continue;
+                    };
+                    layer_at.layer.read_dir(mapped_dir, &mut |entry| {
                         if enumerated.insert(entry.name.clone()) {
                             to_yield.push(entry);
                         }
@@ -97,25 +140,27 @@ impl Vfs {
         if !path.as_ref().is_absolute() {
             panic!(r#"{} does not start with a "/""#, path.as_ref().display());
         }
-        for (_, layer) in self.layers.iter().rev() {
-            if let Some(attrs) = layer.file_attr(path.as_ref()) {
+        for (_, layer_at) in self.layers.iter().rev() {
+            let Some(path) = layer_at.map_path_at(path.as_ref()) else {
+                continue;
+            };
+            if let Some(attrs) = layer_at.layer.file_attr(path) {
                 return Some(attrs);
             }
         }
         None
     }
 
-    pub fn layer_that_opens_file<P>(&self, file: P) -> Option<&dyn Layer>
-    where
-        P: AsRef<Path>,
-    {
-        let file = file.as_ref();
+    pub fn layer_that_opens_file<'a>(&self, file: &'a Path) -> Option<(&'a Path, &dyn Layer)> {
         if !file.is_absolute() {
             panic!(r#"{} does not start with a "/""#, file.display());
         }
-        for (_, layer) in self.layers.iter().rev() {
-            if layer.file_exists(file) {
-                return Some(layer.as_ref());
+        for (_, layer_at) in self.layers.iter().rev() {
+            let Some(file) = layer_at.map_path_at(file) else {
+                continue;
+            };
+            if layer_at.layer.file_exists(file) {
+                return Some((file, layer_at.layer.as_ref()));
             }
         }
         None
@@ -155,18 +200,18 @@ impl Layer for RawFsLayer {
     }
 
     fn dir_exists(&self, dir: &Path) -> bool {
-        let dir = dir.strip_prefix("/").unwrap();
+        let dir = dir.strip_prefix("/").unwrap_or(dir);
         self.source.join(dir).is_dir()
     }
 
     fn file_exists(&self, file: &Path) -> bool {
-        let file = file.strip_prefix("/").unwrap();
+        let file = file.strip_prefix("/").unwrap_or(file);
         self.source.join(file).is_file()
     }
 
     #[tracing::instrument(skip(self, callback))]
     fn read_dir(&self, dir: &Path, callback: &mut dyn FnMut(DirEntry)) {
-        let dir = self.source.join(dir.strip_prefix("/").unwrap());
+        let dir = self.source.join(dir.strip_prefix("/").unwrap_or(dir));
         debug!("dir: {}", dir.display());
         let rdir = match std::fs::read_dir(dir) {
             Ok(rdir) => rdir,
@@ -209,13 +254,13 @@ impl Layer for RawFsLayer {
 
     #[tracing::instrument(skip(self))]
     fn file_attr(&self, file: &Path) -> Option<fuser::FileAttr> {
-        let file = file.strip_prefix("/").unwrap();
+        let file = file.strip_prefix("/").unwrap_or(file);
         let file = self.source.join(file);
         debug!("{}", file.display());
         let metadata = match file.metadata() {
             Ok(m) => m,
             Err(err) => {
-                error!("Could not get metadata for {}: {err}", file.display());
+                debug!("Could not get metadata for {}: {err}", file.display());
                 return None;
             }
         };

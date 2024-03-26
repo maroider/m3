@@ -254,7 +254,7 @@ impl Filesystem for ModdingFileSystem {
             return;
         };
         info!("{}", path.display());
-        let Some(layer) = self.vfs.layer_that_opens_file(path) else {
+        let Some((path, layer)) = self.vfs.layer_that_opens_file(path) else {
             reply.error(ENOENT);
             error!("no layer can open the given file");
             return;
@@ -273,7 +273,7 @@ impl Filesystem for ModdingFileSystem {
             let fd = unsafe { libc::openat(mount_point.fd, cpath.as_ptr().cast(), flags, 0) };
             if fd == -1 {
                 let err = io::Error::last_os_error();
-                error!("Could not open file: {err}");
+                error!("MountPoint Could not open file {}: {err}", path.display());
                 if let Some(err) = err.raw_os_error() {
                     reply.error(err);
                 } else {
@@ -289,7 +289,7 @@ impl Filesystem for ModdingFileSystem {
             reply.opened(idx as u64, flags as u32);
         } else if let Some(raw_fs) = layer.as_any().downcast_ref::<RawFsLayer>() {
             info!("Layer found: {}", type_name_of_val(raw_fs));
-            let path = path.strip_prefix("/").unwrap();
+            let path = path.strip_prefix("/").unwrap_or(path);
             let path = raw_fs.source().join(path);
             info!("Opening {}", path.display());
             let cpath = path
@@ -302,7 +302,7 @@ impl Filesystem for ModdingFileSystem {
             let fd = unsafe { libc::open(cpath.as_ptr().cast(), flags, 0) };
             if fd == -1 {
                 let err = io::Error::last_os_error();
-                error!("Could not open file: {err}");
+                error!("RawFsLayer Could not open file {}: {err}", path.display());
                 if let Some(err) = err.raw_os_error() {
                     reply.error(err);
                 } else {
@@ -409,7 +409,7 @@ impl Filesystem for ModdingFileSystem {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        info!("");
+        info!("start");
         // TODO: Use the VFS instead
         let Some(path) = self.inode_to_path.get(&ino) else {
             // TODO: Make sure this is a reasonable error value for this case?
@@ -450,6 +450,7 @@ impl Filesystem for ModdingFileSystem {
         }
         self.inode_to_path.extend(new_inode_to_path);
 
+        info!("done");
         reply.ok();
     }
 
@@ -622,7 +623,7 @@ struct FileEntry {
 }
 
 impl MountPoint {
-    #[tracing::instrument(skip(next_inode))]
+    #[tracing::instrument(name = "MountPoint::open", skip(next_inode))]
     fn open<P>(name: P, next_inode: &mut ino64_t) -> io::Result<Self>
     where
         P: AsRef<Path> + Debug,
@@ -737,7 +738,7 @@ impl vfs::Layer for MountPoint {
             .unwrap_or(false)
     }
 
-    #[tracing::instrument(skip(self, callback))]
+    #[tracing::instrument(name = "MountPoint::read_dir", skip(self, callback))]
     fn read_dir(&self, dir: &Path, callback: &mut dyn FnMut(vfs::DirEntry)) {
         let Some(entry_idx) = self.find_entry_idx_for_path(dir) else {
             return;
@@ -760,7 +761,7 @@ impl vfs::Layer for MountPoint {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(name = "MountPoint::file_attr", skip(self))]
     fn file_attr(&self, file: &Path) -> Option<fuser::FileAttr> {
         self.find_entry_idx_for_path(file).map(|idx| {
             let file = &self.files[idx];
