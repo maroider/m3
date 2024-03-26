@@ -1,6 +1,8 @@
 use std::{
     any::Any,
+    collections::HashSet,
     ffi::OsString,
+    iter,
     os::linux::fs::MetadataExt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -69,10 +71,22 @@ impl Vfs {
         {
             return None;
         }
-        Some(self.layers.iter().flat_map(move |(_, layer)| {
-            let mut dirs = Vec::new();
-            layer.read_dir(dir.as_ref(), &mut |entry| dirs.push(entry));
-            dirs.into_iter()
+        let mut enumerated = HashSet::new();
+        let mut layers = self.layers.iter();
+        let mut layer_opt = layers.next().map(|(_, l)| l);
+        let mut to_yield = Vec::new();
+        Some(iter::from_fn(move || {
+            if to_yield.is_empty() {
+                if let Some(layer) = layer_opt {
+                    layer.read_dir(dir.as_ref(), &mut |entry| {
+                        if enumerated.insert(entry.name.clone()) {
+                            to_yield.push(entry);
+                        }
+                    });
+                    layer_opt = layers.next().map(|(_, l)| l);
+                }
+            }
+            to_yield.pop()
         }))
     }
 
@@ -116,7 +130,7 @@ pub trait Layer: Any + Send + 'static {
     fn file_attr(&self, file: &Path) -> Option<fuser::FileAttr>;
 }
 
-struct RawFsLayer {
+pub struct RawFsLayer {
     source: PathBuf,
 }
 
@@ -129,6 +143,10 @@ impl RawFsLayer {
             source: source.as_ref().to_owned(),
         }
     }
+
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
 }
 
 impl Layer for RawFsLayer {
@@ -137,21 +155,23 @@ impl Layer for RawFsLayer {
     }
 
     fn dir_exists(&self, dir: &Path) -> bool {
+        let dir = dir.strip_prefix("/").unwrap();
         self.source.join(dir).is_dir()
     }
 
     fn file_exists(&self, file: &Path) -> bool {
+        let file = file.strip_prefix("/").unwrap();
         self.source.join(file).is_file()
     }
 
     #[tracing::instrument(skip(self, callback))]
     fn read_dir(&self, dir: &Path, callback: &mut dyn FnMut(DirEntry)) {
-        let dir = self.source.join(dir);
-        debug!("{}", dir.display());
-        let rdir = match std::fs::read_dir(&dir) {
+        let dir = self.source.join(dir.strip_prefix("/").unwrap());
+        debug!("dir: {}", dir.display());
+        let rdir = match std::fs::read_dir(dir) {
             Ok(rdir) => rdir,
             Err(err) => {
-                error!("{err}");
+                error!("Could not open directory for content enumeration: {err}");
                 return;
             }
         };
@@ -159,6 +179,7 @@ impl Layer for RawFsLayer {
             match subdir {
                 Ok(dirent) => {
                     let name = dirent.file_name();
+                    debug!("Enumerating {name:?}");
                     let typ = match dirent.file_type() {
                         Ok(typ) => typ,
                         Err(err) => {
@@ -180,14 +201,17 @@ impl Layer for RawFsLayer {
                     callback(entry);
                 }
                 Err(err) => {
-                    error!("{err}");
+                    error!("Failed to enumerate: {err}");
                 }
             }
         }
     }
 
+    #[tracing::instrument(skip(self))]
     fn file_attr(&self, file: &Path) -> Option<fuser::FileAttr> {
+        let file = file.strip_prefix("/").unwrap();
         let file = self.source.join(file);
+        debug!("{}", file.display());
         let metadata = match file.metadata() {
             Ok(m) => m,
             Err(err) => {

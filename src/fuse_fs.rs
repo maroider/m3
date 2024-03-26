@@ -26,7 +26,7 @@ use libc::{ino64_t, stat64, ENOENT};
 use slab::Slab;
 use tracing::{debug, debug_span, error, info, trace, warn};
 
-use crate::vfs::{self, Vfs};
+use crate::vfs::{self, RawFsLayer, Vfs};
 
 static EXIT: AtomicBool = AtomicBool::new(false);
 
@@ -77,10 +77,15 @@ impl ModdingFileSystem {
         inode_to_path.insert(1, "/".into());
         let mut path_inodes = HashMap::new();
         path_inodes.insert("/".into(), 1);
+
         let mut next_inode = 2;
         let mount_point = MountPoint::open(path, &mut next_inode)?;
+        let mod_dir = RawFsLayer::new("./testdir/moddir");
+
         let mut vfs = Vfs::new();
         vfs.push_layer(mount_point);
+        vfs.push_layer(mod_dir);
+
         Ok(Self {
             vfs,
             inode_to_path,
@@ -122,14 +127,23 @@ impl Filesystem for ModdingFileSystem {
 
         // FIXME: Factor out the second hashmap lookup here
         let item_path = parent_path.join(entry.name);
-        let Some(attrs) = self.vfs.file_attr(&item_path) else {
+        let Some(mut attrs) = self.vfs.file_attr(&item_path) else {
             error!("Couldn't get file attributes for {}", item_path.display());
             reply.error(ENOENT);
             return;
         };
 
-        info!("{name:?} is ino {}", attrs.ino);
-        self.inode_to_path.insert(attrs.ino, item_path);
+        let ino = &*self
+            .path_inodes
+            .entry(item_path.clone())
+            .or_insert_with(|| {
+                let ino = self.next_inode;
+                self.next_inode += 1;
+                self.inode_to_path.insert(ino, item_path);
+                ino
+            });
+        attrs.ino = *ino;
+        info!("{name:?} is ino {}", ino);
         reply.entry(&Duration::from_secs(1), &attrs, 0);
     }
 
@@ -234,7 +248,11 @@ impl Filesystem for ModdingFileSystem {
     #[tracing::instrument(skip(self, _req, reply))]
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         info!("");
-        let path = self.inode_to_path.get(&ino).unwrap();
+        let Some(path) = self.inode_to_path.get(&ino) else {
+            error!("Unknown inode: {ino}");
+            reply.error(ENOENT);
+            return;
+        };
         info!("{}", path.display());
         let Some(layer) = self.vfs.layer_that_opens_file(path) else {
             reply.error(ENOENT);
@@ -244,7 +262,7 @@ impl Filesystem for ModdingFileSystem {
         if let Some(mount_point) = layer.as_any().downcast_ref::<MountPoint>() {
             info!("Layer found: {}", type_name_of_val(mount_point));
             info!("Opening {}", path.display());
-            let path = path
+            let cpath = path
                 .as_os_str()
                 .as_bytes()
                 .iter()
@@ -252,7 +270,7 @@ impl Filesystem for ModdingFileSystem {
                 .cloned()
                 .chain(iter::once(0))
                 .collect::<Vec<_>>();
-            let fd = unsafe { libc::openat(mount_point.fd, path.as_ptr().cast(), flags, 0) };
+            let fd = unsafe { libc::openat(mount_point.fd, cpath.as_ptr().cast(), flags, 0) };
             if fd == -1 {
                 let err = io::Error::last_os_error();
                 error!("Could not open file: {err}");
@@ -267,6 +285,36 @@ impl Filesystem for ModdingFileSystem {
             }
             let file = unsafe { File::from_raw_fd(fd) };
             let idx = self.open_files.insert(Box::new(file));
+            info!("Opened {}", path.display());
+            reply.opened(idx as u64, flags as u32);
+        } else if let Some(raw_fs) = layer.as_any().downcast_ref::<RawFsLayer>() {
+            info!("Layer found: {}", type_name_of_val(raw_fs));
+            let path = path.strip_prefix("/").unwrap();
+            let path = raw_fs.source().join(path);
+            info!("Opening {}", path.display());
+            let cpath = path
+                .as_os_str()
+                .as_bytes()
+                .iter()
+                .cloned()
+                .chain(iter::once(0))
+                .collect::<Vec<_>>();
+            let fd = unsafe { libc::open(cpath.as_ptr().cast(), flags, 0) };
+            if fd == -1 {
+                let err = io::Error::last_os_error();
+                error!("Could not open file: {err}");
+                if let Some(err) = err.raw_os_error() {
+                    reply.error(err);
+                } else {
+                    // FIXME: Not sure what to return here
+                    error!("No OS error");
+                    reply.error(ENOENT);
+                }
+                return;
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            let idx = self.open_files.insert(Box::new(file));
+            info!("Opened {}", path.display());
             reply.opened(idx as u64, flags as u32);
         } else {
             error!("Unhandled layer type");
@@ -308,6 +356,8 @@ impl Filesystem for ModdingFileSystem {
             }
         }
 
+        error!("Invalid file handle");
+        // FIXME: Find the appropriate error code for this
         reply.error(ENOENT)
     }
 
@@ -365,7 +415,7 @@ impl Filesystem for ModdingFileSystem {
             // TODO: Make sure this is a reasonable error value for this case?
             // Granted, I don't think it's particularly likely that we'll hit this branch without
             // skill issue on my end.
-            warn!("Could not find path for ino {ino}");
+            error!("Could not find path for ino {ino}");
             reply.error(libc::ENOENT);
             return;
         };
@@ -378,16 +428,13 @@ impl Filesystem for ModdingFileSystem {
         let mut new_inode_to_path = Vec::new();
         for (i, entry) in readdir.skip(offset as usize).enumerate() {
             let path = path.join(&entry.name);
-            // We assume there's no mapping, and that this is the only place we need to "materialize"
-            // the mapping.
-            // FIXME: Make the file attributes respect the mapping...
-            info!("Enumerating {}", path.display());
             let inode = self.path_inodes.entry(path.clone()).or_insert_with(|| {
                 let inode = self.next_inode;
-                new_inode_to_path.push((inode, path));
+                new_inode_to_path.push((inode, path.clone()));
                 self.next_inode += 1;
                 inode
             });
+            info!("Yielding {} as ino {inode}", path.display());
             if reply.add(
                 *inode,
                 (i + 1) as i64,
@@ -575,7 +622,7 @@ struct FileEntry {
 }
 
 impl MountPoint {
-    #[tracing::instrument]
+    #[tracing::instrument(skip(next_inode))]
     fn open<P>(name: P, next_inode: &mut ino64_t) -> io::Result<Self>
     where
         P: AsRef<Path> + Debug,
@@ -690,6 +737,7 @@ impl vfs::Layer for MountPoint {
             .unwrap_or(false)
     }
 
+    #[tracing::instrument(skip(self, callback))]
     fn read_dir(&self, dir: &Path, callback: &mut dyn FnMut(vfs::DirEntry)) {
         let Some(entry_idx) = self.find_entry_idx_for_path(dir) else {
             return;
@@ -697,6 +745,7 @@ impl vfs::Layer for MountPoint {
         let current_entry = &self.files[entry_idx];
         if let Some(dir_contents) = &current_entry.dir_contents {
             for (entry_idx, entry_name) in dir_contents {
+                debug!("Enmumerating {entry_name:?}");
                 let file = &self.files[*entry_idx];
                 let Some(typ) = stat_vfs_file_type(&file.stat) else {
                     warn!("Unsupported filetype {}", file.stat.st_mode & libc::S_IFMT);
@@ -711,6 +760,7 @@ impl vfs::Layer for MountPoint {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     fn file_attr(&self, file: &Path) -> Option<fuser::FileAttr> {
         self.find_entry_idx_for_path(file).map(|idx| {
             let file = &self.files[idx];
