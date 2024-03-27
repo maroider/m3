@@ -12,8 +12,6 @@ use std::{
         unix::ffi::{OsStrExt, OsStringExt},
     },
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
-    thread,
     time::{Duration, SystemTime},
 };
 
@@ -26,29 +24,15 @@ use libc::{ino64_t, stat64, ENOENT};
 use slab::Slab;
 use tracing::{debug, debug_span, error, info, trace, warn};
 
-use crate::vfs::{self, RawFsLayer, Vfs};
-
-static EXIT: AtomicBool = AtomicBool::new(false);
-
-pub fn launch() -> eyre::Result<()> {
-    ctrlc::set_handler(|| EXIT.store(true, Ordering::SeqCst))?;
-    let path = "./testdir/gamedir";
-    let _handle = fuser::spawn_mount2(ModdingFileSystem::new(path)?, path, &[])?;
-
-    loop {
-        thread::sleep(Duration::from_millis(100));
-        if EXIT.load(Ordering::SeqCst) {
-            break;
-        }
-    }
-
-    Ok(())
-}
+use crate::{
+    vfs::{self, RawFsLayer, Vfs},
+    Install,
+};
 
 pub trait WriteSeek: Read + Write + Seek + Send {}
 impl<W> WriteSeek for W where W: Read + Write + Seek + Send {}
 
-struct ModdingFileSystem {
+pub struct ModdingFileSystem {
     vfs: Vfs,
     inode_to_path: HashMap<ino64_t, PathBuf>,
     path_inodes: HashMap<PathBuf, ino64_t>,
@@ -69,22 +53,28 @@ impl Debug for ModdingFileSystem {
 }
 
 impl ModdingFileSystem {
-    fn new<P>(path: &P) -> eyre::Result<Self>
-    where
-        P: AsRef<Path> + Debug + ?Sized,
-    {
+    pub fn new(install: &Install) -> eyre::Result<Self> {
         let mut inode_to_path = HashMap::new();
         inode_to_path.insert(1, "/".into());
         let mut path_inodes = HashMap::new();
         path_inodes.insert("/".into(), 1);
 
         let mut next_inode = 2;
-        let mount_point = MountPoint::open(path, &mut next_inode)?;
-        let mod_dir = RawFsLayer::new("./testdir/moddir");
+        let mount_point = MountPoint::open(install.target(), &mut next_inode)?;
 
         let mut vfs = Vfs::new();
-        vfs.push_layer(mount_point);
-        vfs.push_layer(mod_dir);
+        vfs.push_layer(mount_point, None, None);
+
+        for mount in install.mounts() {
+            for dir in mount.dirs() {
+                vfs.push_layer(
+                    RawFsLayer::new(dir.dir()),
+                    mount.at(),
+                    dir.files()
+                        .map(|files| files.map(|file| OsStr::new(file).to_os_string()).collect()),
+                );
+            }
+        }
 
         Ok(Self {
             vfs,

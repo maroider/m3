@@ -17,11 +17,11 @@ use tracing::{debug, debug_span, error};
 pub struct Vfs {
     layers: Slab<LayerAt>,
     // NOTE: Not used yet
-    order: Vec<usize>,
 }
 
 pub struct LayerAt {
     pub at: Option<PathBuf>,
+    pub whitelist: Option<HashSet<OsString>>,
     pub layer: Box<dyn Layer>,
 }
 
@@ -66,27 +66,20 @@ impl Vfs {
     pub fn new() -> Self {
         Self {
             layers: Slab::new(),
-            order: Vec::new(),
         }
     }
 
-    pub fn push_layer_at<L, P>(&mut self, layer: L, path: P)
-    where
-        L: Layer,
-        P: AsRef<Path>,
-    {
-        let _idx = self.layers.insert(LayerAt {
-            at: Some(path.as_ref().to_path_buf()),
-            layer: Box::new(layer),
-        });
-    }
-
-    pub fn push_layer<L>(&mut self, layer: L)
-    where
+    pub fn push_layer<L>(
+        &mut self,
+        layer: L,
+        at: Option<&Path>,
+        whitelist: Option<HashSet<OsString>>,
+    ) where
         L: Layer,
     {
         let _idx = self.layers.insert(LayerAt {
-            at: None,
+            at: at.map(|at| at.to_path_buf()),
+            whitelist,
             layer: Box::new(layer),
         });
     }
@@ -122,6 +115,11 @@ impl Vfs {
                         continue;
                     };
                     layer_at.layer.read_dir(mapped_dir, &mut |entry| {
+                        if let Some(whitelist) = layer_at.whitelist.as_ref() {
+                            if !whitelist.contains(&entry.name) {
+                                return;
+                            }
+                        }
                         if enumerated.insert(entry.name.clone()) {
                             to_yield.push(entry);
                         }
