@@ -23,15 +23,23 @@ pub fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt::init();
 
     let cfg = Config::new()?;
-
     let mut args = std::env::args();
     args.next();
-    let install = cfg.installs().next().unwrap();
-    let _handle = fuser::spawn_mount2(ModdingFileSystem::new(&install)?, install.target(), &[])?;
     if let Some(exe) = args.next() {
+        let cwd = std::env::current_dir().unwrap();
+        let install = cfg
+            .installs()
+            .find(|install| install.target() == cwd)
+            .unwrap();
+        let _handle =
+            fuser::spawn_mount2(ModdingFileSystem::new(&install)?, install.target(), &[])?;
         let mut game = Command::new(exe).args(args).spawn()?;
         game.wait()?;
     } else {
+        let install = cfg.installs().next().unwrap();
+        let _handle =
+            fuser::spawn_mount2(ModdingFileSystem::new(&install)?, install.target(), &[])?;
+
         static EXIT: AtomicBool = AtomicBool::new(false);
         ctrlc::set_handler(|| EXIT.store(true, Ordering::SeqCst))?;
         loop {
