@@ -1,7 +1,10 @@
+#![feature(panic_update_hook)]
+
 use std::{
     borrow::Cow,
     fs::{self, OpenOptions},
-    io::Read,
+    io::{self, Read},
+    panic,
     path::Path,
     process::Command,
     sync::atomic::{AtomicBool, Ordering},
@@ -14,28 +17,71 @@ use directories::ProjectDirs;
 use fuse_fs::ModdingFileSystem;
 use kdl::{KdlDocument, KdlNode};
 use once_cell::sync::Lazy;
+use tracing::{debug, error, info, level_filters::LevelFilter};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 mod fuse_fs;
 mod vfs;
 
-pub fn main() -> eyre::Result<()> {
-    color_eyre::install()?;
-    tracing_subscriber::fmt::init();
+fn main() {
+    let logs_dir = PROJECT_DIRS.data_local_dir().join("logs");
+    fs::create_dir_all(&logs_dir).unwrap();
+    let crash_file = logs_dir.join("m3_crash.log");
+    panic::update_hook(move |prev, info| {
+        error!("Panic occured, check m3_crash.log for info");
+        let _ = fs::write(
+            &crash_file,
+            format!(
+                "panic occured at {:?} with payload: {:?}",
+                info.location(),
+                info.payload().downcast_ref::<&str>()
+            ),
+        );
+        prev(info);
+    });
+    let file_appender = tracing_appender::rolling::never(&logs_dir, "m3.log");
+    let collector = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::Layer::new().with_writer(io::stderr))
+        .with(
+            tracing_subscriber::fmt::Layer::new()
+                .with_writer(file_appender)
+                .with_filter(LevelFilter::DEBUG),
+        );
+    collector.init();
+    info!("Logging initialized");
 
+    color_eyre::install().unwrap();
+    if let Err(e) = run() {
+        error!("main function failed: {e}");
+    }
+}
+
+pub fn run() -> eyre::Result<()> {
     let cfg = Config::new()?;
     let mut args = std::env::args();
     args.next();
     if let Some(exe) = args.next() {
+        info!("Launched normally");
         let cwd = std::env::current_dir().unwrap();
+        debug!("cwd = {}", cwd.display());
+        debug!("config =\n{:#}", cfg.doc);
         let install = cfg
             .installs()
-            .find(|install| install.target() == cwd)
+            .find(|install| {
+                info!("install.target() = {}", install.target().display());
+                install.target() == cwd
+            })
             .unwrap();
+        debug!("Install found for '{}'", install.target().display());
+        info!("Launching FUSE fs");
         let _handle =
             fuser::spawn_mount2(ModdingFileSystem::new(&install)?, install.target(), &[])?;
+        info!("Launching game '{}' with args: '{:?}'", exe, args);
         let mut game = Command::new(exe).args(args).spawn()?;
+        info!("Waiting for game to exit");
         game.wait()?;
     } else {
+        info!("Launched in dev mode");
         let install = cfg.installs().next().unwrap();
         let _handle =
             fuser::spawn_mount2(ModdingFileSystem::new(&install)?, install.target(), &[])?;
